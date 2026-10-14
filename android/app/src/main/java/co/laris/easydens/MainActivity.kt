@@ -76,7 +76,8 @@ class MainActivity : ComponentActivity() {
     private val mReply = mutableStateOf("—")
     private var gatt: BluetoothGatt? = null
     private var rpcReq: BluetoothGattCharacteristic? = null
-    private val key: ByteArray get() = (mSerial.value.repeat(4)).toByteArray(Charsets.UTF_8)
+    private val aesKey: ByteArray get() = mSerial.value.repeat(4).toByteArray(Charsets.UTF_8)
+    private val queue = java.util.ArrayDeque<BluetoothGattCharacteristic>()
 
     private fun log(s: String) { runOnUiThread { mut.value = s } }
 
@@ -89,9 +90,12 @@ class MainActivity : ComponentActivity() {
         }
         log("scanning…")
         ad.bluetoothLeScanner.startScan(
-            listOf(ScanFilter.Builder().setServiceUuid(android.os.ParcelUuid(ED2_SVC)).build()),
+            listOf<ScanFilter>(),   // wide: log every named device until the EasyDens appears
             ScanSettings.Builder().build(), object : ScanCallback() {
                 override fun onScanResult(t: Int, r: ScanResult) {
+                    val n = r.device.name ?: return
+                    log("seen: $n ${r.rssi}")
+                    if (!n.all { it.isDigit() }) return   // EasyDens advertises its serial
                     ad.bluetoothLeScanner.stopScan(this)
                     val dev: BluetoothDevice = r.device
                     log("connect ${dev.name ?: "?"}")
@@ -105,22 +109,37 @@ class MainActivity : ComponentActivity() {
     private val gattCb = object : BluetoothGattCallback() {
         override fun onConnectionStateChange(g: BluetoothGatt, st: Int, ns: Int) {
             when (ns) {
-                BluetoothProfile.STATE_CONNECTED -> { log("connected"); g.discoverServices() }
+                BluetoothProfile.STATE_CONNECTED -> { gatt = g; log("connected"); g.discoverServices() }
                 BluetoothProfile.STATE_DISCONNECTED -> log("disconnected")
             }
         }
         override fun onServicesDiscovered(g: BluetoothGatt, st: Int) {
             val s = g.getService(ED2_SVC) ?: run { log("no ED2 service"); return }
-            for (c in s.characteristics) when (c.uuid) {
-                CH_RPC_REQ -> rpcReq = c
-                CH_DENSITY, CH_TEMP, CH_RPC_REP, CH_FIFTH -> {
-                    g.setCharacteristicNotification(c, true)
-                    c.getDescriptor(CCCD)?.let { d ->
-                        d.value = BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE; g.writeDescriptor(d) }
-                }
+            rpcReq = s.getCharacteristic(CH_RPC_REQ)
+            // Android GATT allows ONE operation at a time: arm notifications one by
+            // one, then read the serial last (Device Information service 0x180A).
+            queue.clear()
+            listOf(CH_DENSITY, CH_TEMP, CH_RPC_REP, CH_FIFTH).forEach { u ->
+                s.getCharacteristic(u)?.let { queue.add(it) }
             }
-            g.getService(UUID.fromString("00001800-0000-1000-8000-00805f9b34fb"))
-                ?.getCharacteristic(CH_SERIAL)?.let { g.readCharacteristic(it) }
+            step(g)
+        }
+
+        private fun step(g: BluetoothGatt) {
+            val c = queue.poll() ?: run {
+                g.getService(UUID.fromString("0000180a-0000-1000-8000-00805f9b34fb"))
+                    ?.getCharacteristic(CH_SERIAL)?.let { g.readCharacteristic(it) }
+                return
+            }
+            g.setCharacteristicNotification(c, true)
+            c.getDescriptor(CCCD)?.let { d ->
+                d.value = BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
+                g.writeDescriptor(d)
+            } ?: step(g)
+        }
+        override fun onDescriptorWrite(g: BluetoothGatt, d: BluetoothGattDescriptor, st: Int) { step(g) }
+        override fun onCharacteristicWrite(g: BluetoothGatt, c: BluetoothGattCharacteristic, st: Int) {
+            writing = false; pump()
         }
         override fun onCharacteristicRead(g: BluetoothGatt, c: BluetoothGattCharacteristic, st: Int) {
             if (c.uuid == CH_SERIAL) {
@@ -134,10 +153,10 @@ class MainActivity : ComponentActivity() {
         override fun onCharacteristicChanged(g: BluetoothGatt, c: BluetoothGattCharacteristic) {
             val d = c.value ?: return
             when (c.uuid) {
-                CH_DENSITY -> aes(d, key, true)?.let { p -> f32le(p)?.let { mDensity.value = "%.5f g/cm³".format(it) } }
-                CH_TEMP -> aes(d, key, true)?.let { p -> f32le(p)?.let { mTemp.value = "%.2f °C".format(it) } }
+                CH_DENSITY -> aes(d, aesKey, true)?.let { p -> f32le(p)?.let { mDensity.value = "%.5f g/cm³".format(it) } }
+                CH_TEMP -> aes(d, aesKey, true)?.let { p -> f32le(p)?.let { mTemp.value = "%.2f °C".format(it) } }
                 CH_FIFTH -> f32le(d)?.let { mBatt.value = "%.3f V".format(it) }
-                CH_RPC_REP -> aes(d.drop(2).toByteArray(), key, true)?.let { p ->
+                CH_RPC_REP -> aes(d.drop(2).toByteArray(), aesKey, true)?.let { p ->
                     mReply.value = "op=%d st=%d %s".format(p[0].toInt() and 0xff, p.getOrElse(1){255.toByte()}.toInt() and 0xff,
                         hex(p.drop(2).toByteArray()))
                     if ((p[0].toInt() and 0xff) == 16 && p.size >= 4)
@@ -147,13 +166,22 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    fun send(cmd: ByteArray) {
-        val ct = aes(cmd, key, false) ?: run { log("encrypt fail"); return }
+    private val sendQ = java.util.ArrayDeque<ByteArray>()
+    private var writing = false
+
+    fun send(cmd: ByteArray) { sendQ.add(cmd); pump() }
+
+    private fun pump() {
+        if (writing) return
+        val cmd = sendQ.poll() ?: return
+        val ct = aes(cmd, aesKey, false) ?: run { log("encrypt fail"); return }
         val frame = byteArrayOf(0x80.toByte(), ct.size.toByte()) + ct
-        val c = rpcReq ?: run { log("not ready"); return }
+        val c = rpcReq ?: run { log("not ready"); sendQ.clear(); return }
+        val g = gatt ?: return
+        writing = true
         c.writeType = BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE
         c.value = frame
-        gatt?.writeCharacteristic(c)
+        g.writeCharacteristic(c)
     }
 
     @Composable
