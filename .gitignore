@@ -1,3 +1,6 @@
 EasyDensCtrl.app/
 __pycache__/
 *.log
+build/
+.gradle/
+local.properties
