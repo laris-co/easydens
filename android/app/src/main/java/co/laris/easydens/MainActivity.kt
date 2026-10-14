@@ -27,12 +27,16 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontFamily
-import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.ui.unit.dp
 import java.util.UUID
 import javax.crypto.Cipher
 import javax.crypto.spec.IvParameterSpec
 import javax.crypto.spec.SecretKeySpec
+
+private fun f32bytes(v: Float): ByteArray =
+    byteArrayOf((v.toBits() and 0xff).toByte(), ((v.toBits() shr 8) and 0xff).toByte(),
+        ((v.toBits() shr 16) and 0xff).toByte(), ((v.toBits() shr 24) and 0xff).toByte())
 
 // EasyDens ED2 BLE protocol — reverse-engineered from Brew Meister 6.7.0 and
 // verified against a live HCI capture. See laris-co/easydens PROTOCOL.md.
@@ -80,6 +84,25 @@ class MainActivity : ComponentActivity() {
     private val queue = java.util.ArrayDeque<BluetoothGattCharacteristic>()
 
     private fun log(s: String) { runOnUiThread { mut.value = s } }
+    private val densBuf = mutableListOf<Float>()
+    private val tempBuf = mutableListOf<Float>()
+    private var calPending = false
+
+    // Kell (1975) water density in g/cm³ — matches Anton Paar's reference to <1e-5 near 30 °C.
+    private fun waterAt(t: Double): Double {
+        val num = 999.83952 + 16.945176*t - 7.9870401e-3*t*t - 46.170461e-6*t*t*t +
+            105.56302e-9*t*t*t*t - 280.54253e-12*t*t*t*t*t
+        return num / (1.0 + 16.879850e-3*t) / 1000.0
+    }
+
+    fun calibrate() {
+        if (densBuf.size < 5 || tempBuf.size < 5) { log("need 5+ readings first"); return }
+        val md = densBuf.takeLast(5).average()
+        val mt = tempBuf.takeLast(5).average()
+        log("cal: meas=%.5f @ %.2f°C, water=%.5f".format(md, mt, waterAt(mt)))
+        calPending = true
+        send(byteArrayOf(0x11))   // fetch stored offset first, finish in the reply handler
+    }
 
     private fun connect() {
         val bm = getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager
@@ -137,51 +160,69 @@ class MainActivity : ComponentActivity() {
                 g.writeDescriptor(d)
             } ?: step(g)
         }
+
         override fun onDescriptorWrite(g: BluetoothGatt, d: BluetoothGattDescriptor, st: Int) { step(g) }
-        override fun onCharacteristicWrite(g: BluetoothGatt, c: BluetoothGattCharacteristic, st: Int) {
-            writing = false; pump()
-        }
         override fun onCharacteristicRead(g: BluetoothGatt, c: BluetoothGattCharacteristic, st: Int) {
             if (c.uuid == CH_SERIAL) {
                 val v = c.value?.toString(Charsets.UTF_8)?.trim()
                 if (!v.isNullOrEmpty()) {
                     mSerial.value = v; log("serial $v")
-                    send(byteArrayOf(0x0f)); send(byteArrayOf(0x10)); send(byteArrayOf(1, 0))
+                    android.os.Handler(android.os.Looper.getMainLooper()).apply {
+                        post { send(byteArrayOf(0x0f)) }
+                        postDelayed({ send(byteArrayOf(0x10)) }, 400)
+                        postDelayed({ send(byteArrayOf(1, 0)) }, 800)
+                    }
                 }
             }
         }
         override fun onCharacteristicChanged(g: BluetoothGatt, c: BluetoothGattCharacteristic) {
             val d = c.value ?: return
             when (c.uuid) {
-                CH_DENSITY -> aes(d, aesKey, true)?.let { p -> f32le(p)?.let { mDensity.value = "%.5f g/cm³".format(it) } }
-                CH_TEMP -> aes(d, aesKey, true)?.let { p -> f32le(p)?.let { mTemp.value = "%.2f °C".format(it) } }
+                CH_DENSITY -> aes(d, aesKey, true)?.let { p -> f32le(p)?.let {
+                    val sg = it.toDouble() / waterAt(tempBuf.lastOrNull()?.toDouble() ?: 30.0)
+                    mDensity.value = "%.5f g/cm³ · SG %.4f".format(it, sg)
+                    densBuf.add(it); if (densBuf.size > 20) densBuf.removeAt(0)
+                } }
+                CH_TEMP -> aes(d, aesKey, true)?.let { p -> f32le(p)?.let {
+                    mTemp.value = "%.2f °C".format(it)
+                    tempBuf.add(it); if (tempBuf.size > 20) tempBuf.removeAt(0)
+                } }
                 CH_FIFTH -> f32le(d)?.let { mBatt.value = "%.3f V".format(it) }
                 CH_RPC_REP -> aes(d.drop(2).toByteArray(), aesKey, true)?.let { p ->
                     mReply.value = "op=%d st=%d %s".format(p[0].toInt() and 0xff, p.getOrElse(1){255.toByte()}.toInt() and 0xff,
                         hex(p.drop(2).toByteArray()))
-                    if ((p[0].toInt() and 0xff) == 16 && p.size >= 4)
+                    val op = p[0].toInt() and 0xff
+                    if (op == 16 && p.size >= 4)
                         mReply.value += " standby=${(p[2].toInt() and 0xff) or ((p[3].toInt() and 0xff) shl 8)} min"
+                    if (op == 17 && p.size >= 10) {
+                        val off = f32le(p.copyOfRange(2, 6)) ?: 0f
+                        val gain = f32le(p.copyOfRange(6, 10)) ?: 1f
+                        mReply.value += " | offset=%.5f gain=%.3f".format(off, gain)
+                        if (calPending) {
+                            // reply [17, st, f32 offset, f32 gain] — Brew Meister: new = stored + (water − measured)
+                            val md = densBuf.takeLast(5).average().toDouble()
+                            val mt = tempBuf.takeLast(5).average().toDouble()
+                            val newOff = off + (waterAt(mt) - md)
+                            log("cal: stored=%.5f new=%.5f".format(off, newOff))
+                            calPending = false
+                            android.os.Handler(android.os.Looper.getMainLooper()).apply {
+                                postDelayed({ send(byteArrayOf(8) + f32bytes(newOff.toFloat()) + f32bytes(1.0f)) }, 400)
+                                postDelayed({ send(byteArrayOf(0x11)) }, 900)   // read back to confirm
+                            }
+                        }
+                    }
                 }
             }
         }
     }
 
-    private val sendQ = java.util.ArrayDeque<ByteArray>()
-    private var writing = false
-
-    fun send(cmd: ByteArray) { sendQ.add(cmd); pump() }
-
-    private fun pump() {
-        if (writing) return
-        val cmd = sendQ.poll() ?: return
+    fun send(cmd: ByteArray) {
         val ct = aes(cmd, aesKey, false) ?: run { log("encrypt fail"); return }
         val frame = byteArrayOf(0x80.toByte(), ct.size.toByte()) + ct
-        val c = rpcReq ?: run { log("not ready"); sendQ.clear(); return }
-        val g = gatt ?: return
-        writing = true
+        val c = rpcReq ?: run { log("not ready"); return }
         c.writeType = BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE
         c.value = frame
-        g.writeCharacteristic(c)
+        gatt?.writeCharacteristic(c)
     }
 
     @Composable
@@ -206,6 +247,9 @@ class MainActivity : ComponentActivity() {
                     Button(onClick = { send(byteArrayOf(0x0f)) }) { Text("LED") }
                     Button(onClick = { send(byteArrayOf(0x10)) }) { Text("Standby") }
                     Button(onClick = { send(byteArrayOf(0x11)) }) { Text("ZeroAdj") }
+                }
+                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Button(onClick = { calibrate() }) { Text("Calibrate with water") }
                 }
                 Text("key = name×4 · AES-256-CBC · laris-co/easydens", fontSize = 11.sp, color = Color.Gray)
             }
