@@ -101,8 +101,45 @@ class MainActivity : ComponentActivity() {
         val mt = tempBuf.takeLast(5).average()
         log("cal: meas=%.5f @ %.2f°C, water=%.5f".format(md, mt, waterAt(mt)))
         calPending = true
-        send(byteArrayOf(0x11))   // fetch stored offset first, finish in the reply handler
+        send(byteArrayOf(0x11))   // fetch stored offset; continue in the op=17 reply
     }
+
+    private val og = mutableStateOf<Float?>(null)
+    private val logRows = mutableListOf<String>()
+
+    private fun plato(sg: Double): Double =
+        182.4601*sg*sg*sg - 775.6821*sg*sg + 1262.7794*sg - 669.5622
+    private fun currentSg(): Double? = densBuf.lastOrNull()?.let { d ->
+        val t = tempBuf.lastOrNull()?.toDouble() ?: 30.0
+        d.toDouble() / waterAt(t)
+    }
+    private fun abv(): Double? {
+        val o = og.value?.toDouble() ?: return null
+        val f = currentSg() ?: return null
+        return (o - f) * 131.25
+    }
+    private fun attenuation(): Double? {
+        val o = og.value?.toDouble() ?: return null
+        val f = currentSg() ?: return null
+        return (o - f) / o * 100.0
+    }
+    private fun setOg() {
+        val sg = currentSg() ?: run { mut.value = "no reading for OG"; return }
+        og.value = sg.toFloat()
+        mut.value = "OG set: %.4f".format(sg)
+    }
+    private fun logReading() {
+        val sg = currentSg() ?: run { mut.value = "no reading to log"; return }
+        val line = "%s SG %.4f  %.5f g/cm³  %.2f°C  ABV %s  AA %s".format(
+            java.time.LocalDateTime.now().withNano(0),
+            sg, densBuf.last(), tempBuf.last(),
+            abv()?.let { "%.2f%%".format(it) } ?: "—",
+            attenuation()?.let { "%.1f%%".format(it) } ?: "—")
+        logRows.add(line)
+        java.io.File(filesDir, "batch_log.txt").appendText(line + "\n")
+        mut.value = "logged ${logRows.size} readings"
+    }
+
 
     private fun connect() {
         val bm = getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager
@@ -238,6 +275,17 @@ class MainActivity : ComponentActivity() {
                         Text(k, color = Color.Gray); Text(v, fontFamily = FontFamily.Monospace)
                     }
                 }
+                listOf(
+                    "OG" to (og.value?.let { "%.4f".format(it) } ?: "tap Set OG"),
+                    "°P now" to (currentSg()?.let { "%.2f".format(plato(it)) } ?: "—"),
+                    "ABV" to (abv()?.let { "%.2f %%".format(it) } ?: "— needs OG"),
+                    "attenuation" to (attenuation()?.let { "%.1f %%".format(it) } ?: "— needs OG"),
+                    "batch log" to "${logRows.size} readings"
+                ).forEach { (k, v) ->
+                    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                        Text(k, color = Color.Gray); Text(v, fontFamily = FontFamily.Monospace)
+                    }
+                }
                 Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     Button(onClick = { connect() }) { Text("Scan") }
                     Button(onClick = { send(byteArrayOf(1, 0)) }) { Text("Start") }
@@ -249,7 +297,9 @@ class MainActivity : ComponentActivity() {
                     Button(onClick = { send(byteArrayOf(0x11)) }) { Text("ZeroAdj") }
                 }
                 Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    Button(onClick = { calibrate() }) { Text("Calibrate with water") }
+                    Button(onClick = { calibrate() }) { Text("Cal H₂O") }
+                    Button(onClick = { setOg() }) { Text("Set OG") }
+                    Button(onClick = { logReading() }) { Text("Log") }
                 }
                 Text("key = name×4 · AES-256-CBC · laris-co/easydens", fontSize = 11.sp, color = Color.Gray)
             }
